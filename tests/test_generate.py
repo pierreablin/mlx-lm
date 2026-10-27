@@ -164,6 +164,26 @@ class TestGenerate(unittest.TestCase):
                 )
                 self.assertEqual([t for t, _, _ in gen], expected)
 
+    def test_speculative_draft_is_greedy(self):
+        # The sampler always picks 1 and the draft prefers 0. A greedy draft
+        # proposes 0, so the target rejects all drafts.
+        model = self.model
+
+        class Draft:
+            layers = model.layers
+
+            def __call__(self, inputs, cache=None):
+                return model(inputs, cache=cache).at[..., 0].add(1e4)
+
+        def sampler(logprobs):
+            return mx.ones(logprobs.shape[:-1], dtype=mx.uint32)
+
+        prompt = mx.array(self.tokenizer.encode("hello"))
+        gen = speculative_generate_step(
+            prompt, model, Draft(), num_draft_tokens=2, max_tokens=6, sampler=sampler
+        )
+        self.assertEqual([(t, d) for t, _, d in gen], [(1, False)] * 6)
+
     def test_stream_generate_input_embeddings(self):
         sampler = make_sampler(temp=0.0)  # determinate sampler
 

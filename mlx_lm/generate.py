@@ -521,7 +521,8 @@ def speculative_generate_step(
         max_tokens (int): The maximum number of tokens. Use``-1`` for an infinite
           generator. Default: ``256``.
         sampler (Sampler, optional): A sampler for sampling a
-          token from a vector of log probabilities. Default: ``None``.
+          token from a vector of log probabilities. The draft model always
+          picks its most likely token. Default: ``None``.
         logits_processors (List[LogitsProcessor], optional):
           A list of functions that take tokens and logits and return the processed
           logits. Default: ``None``.
@@ -565,7 +566,7 @@ def speculative_generate_step(
         kv_bits=kv_bits,
     )
 
-    def _process_and_sample(tokens, logits):
+    def _process_and_sample(tokens, logits, sampler):
         if logits_processors:
             for processor in logits_processors:
                 logits = processor(tokens, logits)
@@ -574,7 +575,7 @@ def speculative_generate_step(
         y = sampler(logprobs)
         return y, logprobs
 
-    def _step(model, cache, y, n_predict=1):
+    def _step(model, cache, y, sampler, n_predict=1):
         logits = model(y[None], cache=cache)
         logits = logits[:, -n_predict:, :]
 
@@ -588,12 +589,12 @@ def speculative_generate_step(
                 prev_tokens = (
                     mx.concatenate([prev_tokens, y]) if prev_tokens is not None else y
                 )
-                y, logprobs = _process_and_sample(prev_tokens, logits[:, i, :])
+                y, logprobs = _process_and_sample(prev_tokens, logits[:, i, :], sampler)
                 out_y.append(y)
                 out_logprobs.append(logprobs)
             return mx.concatenate(out_y, axis=0), mx.concatenate(out_logprobs, axis=0)
         else:
-            return _process_and_sample(None, logits.squeeze(0))
+            return _process_and_sample(None, logits.squeeze(0), sampler)
 
     def _prefill(model, cache, y):
         while y.size > 1:
@@ -614,7 +615,7 @@ def speculative_generate_step(
             return mx.array([], mx.uint32)
         ys = []
         for _ in range(num_draft):
-            y, _ = _step(draft_model, draft_cache, y)
+            y, _ = _step(draft_model, draft_cache, y, greedy_sampler)
             mx.async_eval(y)
             ys.append(y)
         return mx.concatenate(ys)
@@ -636,7 +637,7 @@ def speculative_generate_step(
                         : prev_tokens.size - y.size - num_draft + 1
                     ]
                 y = mx.concatenate([y, draft_tokens])
-                tokens, logprobs = _step(model, model_cache, y, num_draft + 1)
+                tokens, logprobs = _step(model, model_cache, y, sampler, num_draft + 1)
                 mx.eval(tokens, draft_tokens)
                 draft_tokens = draft_tokens.tolist()
                 tokens = tokens.tolist()
