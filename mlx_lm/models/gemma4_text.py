@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..kernels import on_metal, softmax_topk
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
 from .rope_utils import initialize_rope
@@ -131,15 +132,17 @@ class Router(nn.Module):
 
         expert_scores = self.proj(x)
 
-        top_k_indices = mx.argpartition(
-            expert_scores, kth=-self.config.top_k_experts, axis=-1
-        )
-        top_k_indices = mx.stop_gradient(
-            top_k_indices[..., -self.config.top_k_experts :]
-        )
-
-        top_k_weights = mx.take_along_axis(expert_scores, top_k_indices, axis=-1)
-        top_k_weights = mx.softmax(top_k_weights, axis=-1)
+        k = self.config.top_k_experts
+        if not self.training and on_metal():
+            # The softmax of the top k scores: the softmax renormalized over the top k.
+            top_k_indices, top_k_weights = softmax_topk(
+                expert_scores, top_k=k, normalize=True
+            )
+        else:
+            top_k_indices = mx.argpartition(expert_scores, kth=-k, axis=-1)
+            top_k_indices = mx.stop_gradient(top_k_indices[..., -k:])
+            top_k_weights = mx.take_along_axis(expert_scores, top_k_indices, axis=-1)
+            top_k_weights = mx.softmax(top_k_weights, axis=-1)
         top_k_weights = top_k_weights * self.per_expert_scale[top_k_indices]
 
         return top_k_indices, top_k_weights
@@ -147,6 +150,9 @@ class Router(nn.Module):
 
 class GeGLU(nn.Module):
     """GELU-gated linear unit activation for SwitchGLU."""
+
+    # The activation in the fused Metal kernels (kernels/switch_glu.py): tanh GELU.
+    metal_act = 1
 
     def __call__(self, x, gate):
         return geglu(gate, x)
@@ -169,10 +175,7 @@ class Experts(nn.Module):
     def __call__(
         self, x: mx.array, top_k_indices: mx.array, top_k_weights: mx.array
     ) -> mx.array:
-        w = mx.expand_dims(top_k_weights, -1)
-        y = self.switch_glu(x, top_k_indices)
-
-        return (w * y).sum(-2)
+        return self.switch_glu.combine(x, top_k_indices, top_k_weights)
 
 
 class Attention(nn.Module):

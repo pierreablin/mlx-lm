@@ -2,6 +2,7 @@
 
 """Fused Metal kernels, one kernel per file."""
 
+from ._common import on_metal
 from .expert_routing import expert_routing
 from .norm_add_norm import norm_add_norm, pre_norm
 from .post_expert_norm_combine import post_expert_norm_combine
@@ -16,6 +17,7 @@ __all__ = [
     "can_combine",
     "expert_routing",
     "norm_add_norm",
+    "on_metal",
     "post_expert_norm_combine",
     "pre_norm",
     "qk_norm",

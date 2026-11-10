@@ -5,8 +5,6 @@ summed, in two kernels."""
 
 import mlx.core as mx
 
-from ..models.switch_layers import QuantizedSwitchLinear, SwiGLU
-
 # x[16] as floats and their sum; for 4 bits, x[i] is prescaled by 1 / 16^(i % 4) so
 # that the masked nibbles of a uint16 need no shift (as mlx's qmv).
 _HEADER = """
@@ -23,6 +21,14 @@ inline float load16(const device U* x, thread float* xs) {
         }
     }
     return s;
+}
+
+template <int ACT>
+inline float glu_act(float g) {
+    if (ACT == 1) {
+        return 0.5f * g * (1.0f + metal::precise::tanh(0.7978845608028654f * (g + 0.044715f * g * g * g)));
+    }
+    return g / (1.0f + metal::exp(-g));
 }
 
 template <int BITS>
@@ -46,7 +52,7 @@ inline float qdot16(const device uint8_t* w, thread const float* xs) {
 }
 """
 
-# The gate and up rows of the K experts (K * N rows of D values), SwiGLU, times
+# The gate and up rows of the K experts (K * N rows of D values), the GLU, times
 # each expert's weight. A threadgroup takes RPS * SPT rows of one expert: RPS rows
 # per simdgroup, 16 values per lane.
 _GATE_UP_SOURCE = """
@@ -80,7 +86,7 @@ _GATE_UP_SOURCE = """
         float g = simd_sum(ga[r]);
         float u = simd_sum(ua[r]);
         if (lane == 0) {
-            h[slot * N + row0 + r] = static_cast<T>(g / (1.0f + metal::exp(-g)) * u * we);
+            h[slot * N + row0 + r] = static_cast<T>(glu_act<ACT>(g) * u * we);
         }
     }
 """
@@ -113,7 +119,7 @@ _DOWN_SOURCE = """
     for (int r = 0; r < RPS; r++) {
         float a = simd_sum(acc[r]);
         if (lane == 0) {
-            y[row0 + r] = static_cast<T>(a);
+            y[row0 + r] = static_cast<O>(a);
         }
     }
 """
@@ -142,8 +148,9 @@ _DOWN_SHAPE = (1, 4)
 
 def can_combine(switch_glu, x: mx.array) -> bool:
     """Whether ``switch_glu_combine`` takes ``x``: one token, bf16 or fp16, on Metal,
-    not training, and a SwitchGLU with SwiGLU and affine 4- or 8-bit experts
-    (group size 32, 64 or 128, scales in the dtype of ``x``, no bias)."""
+    not training, and a SwitchGLU whose activation has a ``metal_act`` (SwiGLU, GeGLU)
+    and whose experts are affine 4- or 8-bit (group size 32, 64 or 128, scales in the
+    dtype of ``x``, no bias)."""
     projs = (switch_glu.gate_proj, switch_glu.up_proj, switch_glu.down_proj)
     if not (
         mx.metal.is_available()
@@ -151,26 +158,28 @@ def can_combine(switch_glu, x: mx.array) -> bool:
         and x.size == x.shape[-1]
         and x.dtype in (mx.bfloat16, mx.float16)
         and not switch_glu.training
-        and type(switch_glu.activation) is SwiGLU
-        and all(type(p) is QuantizedSwitchLinear for p in projs)
+        and getattr(switch_glu.activation, "metal_act", None) in (0, 1)
     ):
         return False
-    N, D = switch_glu.gate_proj.weight.shape[1], x.shape[-1]
+    bits, group_size = getattr(projs[0], "bits", None), getattr(
+        projs[0], "group_size", None
+    )
     return (
-        all(
-            p.mode == "affine"
-            and p.bits in (4, 8)
-            and p.group_size in (32, 64, 128)
-            and p.bits == projs[0].bits
-            and p.group_size == projs[0].group_size
+        bits in (4, 8)
+        and group_size in (32, 64, 128)
+        and all(
+            getattr(p, "mode", None) == "affine"
+            and getattr(p, "bits", None) == bits
+            and getattr(p, "group_size", None) == group_size
+            and p.weight.ndim == 3
             and p.scales.dtype == x.dtype
             and p.get("biases") is not None
             and "bias" not in p
             and getattr(p, "global_scale", None) is None
             for p in projs
         )
-        and D % 16 == 0
-        and N % 16 == 0
+        and x.shape[-1] % 16 == 0
+        and switch_glu.gate_proj.weight.shape[1] % 16 == 0
     )
 
 
@@ -178,14 +187,17 @@ def switch_glu_combine(
     switch_glu, x: mx.array, inds: mx.array, weights: mx.array
 ) -> mx.array:
     """The sum of ``switch_glu``'s experts ``inds`` on the one token ``x``, weighted by
-    ``weights``: ``(switch_glu(x, inds) * weights[..., None]).sum(-2)``, in two kernels.
-    Needs ``can_combine(switch_glu, x)``."""
+    ``weights``: ``(switch_glu(x, inds) * weights[..., None]).sum(-2)`` and of its
+    dtype, in two kernels. Needs ``can_combine(switch_glu, x)``."""
     gp, up, dp = switch_glu.gate_proj, switch_glu.up_proj, switch_glu.down_proj
     K, N, D = inds.size, gp.weight.shape[1], x.shape[-1]
     inds = inds.reshape(-1).astype(mx.uint32)
     weights = weights.reshape(-1)
+    out_dtype = mx.result_type(x.dtype, weights.dtype)
     template = [
         ("T", x.dtype),
+        ("O", out_dtype),
+        ("ACT", switch_glu.activation.metal_act),
         ("D", D),
         ("N", N),
         ("K", K),
@@ -219,5 +231,5 @@ def switch_glu_combine(
         grid=(-(-D // (rps * spt)) * 32 * spt, 1, 1),
         threadgroup=(32 * spt, 1, 1),
         output_shapes=[x.shape],
-        output_dtypes=[x.dtype],
+        output_dtypes=[out_dtype],
     )[0]

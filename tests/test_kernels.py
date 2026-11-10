@@ -2,6 +2,7 @@
 
 import itertools
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import mlx.core as mx
@@ -21,9 +22,19 @@ from mlx_lm.kernels import (
     sparse_mla_attention,
     switch_glu_combine,
 )
-from mlx_lm.models import qwen3_moe
+from mlx_lm.models import (
+    deepseek_v3,
+    gemma4_text,
+    lfm2_moe,
+    mixtral,
+    olmoe,
+    qwen2_moe,
+    qwen3_moe,
+    qwen3_next,
+    switch_layers,
+)
 from mlx_lm.models.cache import make_prompt_cache
-from mlx_lm.models.switch_layers import SwitchGLU
+from mlx_lm.models.switch_layers import SwiGLU, SwitchGLU
 
 TOL = {mx.float32: 1e-5, mx.bfloat16: 1e-2}
 
@@ -98,16 +109,19 @@ def _sparse_mla_ref(q, q_pe, kv, k_pe, idx, scale):
     return (probs[..., None] * values[None]).sum(-2)  # [H, L, r]
 
 
-def _switch_glu(dims, hidden, experts, *, bits, group_size, dtype):
+def _switch_glu(dims, hidden, experts, *, bits, group_size, dtype, activation=None):
     mx.random.seed(4)
-    switch_glu = SwitchGLU(dims, hidden, experts)
+    # Not `activation or ...`: a module without parameters is an empty dict.
+    if activation is None:
+        activation = SwiGLU()
+    switch_glu = SwitchGLU(dims, hidden, experts, activation=activation)
     switch_glu.set_dtype(dtype)
     nn.quantize(switch_glu, group_size=group_size, bits=bits)
     switch_glu.eval()
     return switch_glu
 
 
-def _switch_glu_combine_ref(switch_glu, x, inds, weights):
+def _switch_glu_combine_ref(switch_glu, x, inds, weights, act=nn.silu):
     # The selected experts in fp32, from the dequantized weights.
     def expert(proj, e):
         w = mx.dequantize(
@@ -120,8 +134,41 @@ def _switch_glu_combine_ref(switch_glu, x, inds, weights):
     for e, w in zip(inds.reshape(-1).tolist(), weights.reshape(-1).tolist()):
         gate = expert(switch_glu.gate_proj, e) @ x
         up = expert(switch_glu.up_proj, e) @ x
-        y = y + w * (expert(switch_glu.down_proj, e) @ (nn.silu(gate) * up))
+        y = y + w * (expert(switch_glu.down_proj, e) @ (act(gate) * up))
     return y
+
+
+# One config for the MoE blocks below: each reads the fields it needs.
+_MOE_ARGS = SimpleNamespace(
+    hidden_size=128,
+    intermediate_size=64,
+    moe_intermediate_size=64,
+    num_experts=16,
+    num_local_experts=16,
+    n_routed_experts=16,
+    num_experts_per_tok=4,
+    top_k_experts=4,
+    norm_topk_prob=True,
+    shared_expert_intermediate_size=64,
+    n_shared_experts=1,
+    mlp_bias=False,
+    rms_norm_eps=1e-6,
+    routed_scaling_factor=2.5,
+    use_expert_bias=True,
+    n_group=4,
+    topk_group=2,
+    topk_method="noaux_tc",
+)
+
+
+class _Gemma4MoE(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self.router = gemma4_text.Router(args)
+        self.experts = gemma4_text.Experts(args)
+
+    def __call__(self, x):
+        return self.experts(x, *self.router(x))
 
 
 def _tiny_qwen3_moe():
@@ -242,6 +289,14 @@ class TestKernels(unittest.TestCase):
                 self.assertEqual(inds.dtype, mx.uint32)
                 self.assertTrue(mx.array_equal(inds, ref_inds))
                 self._assert_close(weights, ref_weights, TOL[mx.float32])
+                # bf16 logits: bf16 weights, as mx.softmax.
+                inds, weights = softmax_topk(
+                    logits.astype(mx.bfloat16), top_k=k, normalize=normalize
+                )
+                self.assertEqual(weights.dtype, mx.bfloat16)
+                self._assert_close(
+                    weights, ref_weights.astype(mx.bfloat16), TOL[mx.bfloat16]
+                )
 
     def test_switch_glu_combine(self):
         # 640 values per row leave the last block of 512 partial; 384 is not a
@@ -250,19 +305,28 @@ class TestKernels(unittest.TestCase):
         dims, hidden, experts = 640, 384, 16
         inds = mx.array([[[3, 11, 0, 7]]], dtype=mx.uint32)
         weights = mx.array([[[0.4, 0.3, 0.2, 0.1]]])
-        for bits, group_size, dtype in itertools.product(
-            (4, 8), (32, 64, 128), (mx.bfloat16, mx.float16)
+        activations = ((SwiGLU(), nn.silu), (gemma4_text.GeGLU(), nn.gelu_approx))
+        for bits, group_size, dtype, (activation, act) in itertools.product(
+            (4, 8), (32, 64, 128), (mx.bfloat16, mx.float16), activations
         ):
             switch_glu = _switch_glu(
-                dims, hidden, experts, bits=bits, group_size=group_size, dtype=dtype
+                dims,
+                hidden,
+                experts,
+                bits=bits,
+                group_size=group_size,
+                dtype=dtype,
+                activation=activation,
             )
             x = mx.random.normal((1, 1, dims)).astype(dtype)
             self.assertTrue(can_combine(switch_glu, x))
-            out = switch_glu_combine(switch_glu, x, inds, weights)
-            ref = _switch_glu_combine_ref(switch_glu, x, inds, weights)
-            self._assert_close(
-                out, ref.reshape(x.shape).astype(dtype), TOL[mx.bfloat16]
-            )
+            ref = _switch_glu_combine_ref(switch_glu, x, inds, weights, act)
+            ref = ref.reshape(x.shape)
+            # The output has the dtype of the weighted sum: float32 weights promote.
+            for w in (weights, weights.astype(dtype)):
+                out = switch_glu_combine(switch_glu, x, inds, w)
+                ref_dtype = mx.result_type(dtype, w.dtype)
+                self._assert_close(out, ref.astype(ref_dtype), TOL[mx.bfloat16])
 
     def test_can_combine(self):
         x = mx.random.normal((1, 1, 512)).astype(mx.bfloat16)
@@ -293,10 +357,47 @@ class TestKernels(unittest.TestCase):
             return model(mx.array([[5]]), cache=cache)
 
         out = decode()
-        with patch.object(qwen3_moe, "can_combine", lambda *args: False):
+        with (
+            patch.object(switch_layers, "can_combine", lambda *args: False),
+            patch.object(qwen3_moe, "on_metal", lambda: False),
+        ):
             ref = decode()
         self._assert_close(out, ref, 3e-2)
         self.assertTrue(mx.array_equal(out.argmax(-1), ref.argmax(-1)))
+
+    def test_moe_blocks(self):
+        # Each model's MoE block on one token: its routing (the softmax_topk kernel
+        # where the model uses it) and SwitchGLU.combine, against the generic path.
+        blocks = {
+            qwen3_next: qwen3_next.Qwen3NextSparseMoeBlock,
+            qwen2_moe: qwen2_moe.Qwen2MoeSparseMoeBlock,
+            mixtral: mixtral.MixtralSparseMoeBlock,
+            olmoe: olmoe.OlmoeSparseMoeBlock,
+            deepseek_v3: deepseek_v3.DeepseekV3MoE,
+            lfm2_moe: lfm2_moe.Lfm2MoeSparseMoeBlock,
+            gemma4_text: _Gemma4MoE,
+        }
+        for module, block_cls in blocks.items():
+            with self.subTest(module.__name__):
+                mx.random.seed(7)
+                block = block_cls(_MOE_ARGS)
+                block.set_dtype(mx.bfloat16)
+                nn.quantize(block, group_size=64, bits=4)
+                block.eval()
+                x = mx.random.normal((1, 1, 128)).astype(mx.bfloat16)
+                with patch.object(
+                    switch_layers,
+                    "switch_glu_combine",
+                    wraps=switch_layers.switch_glu_combine,
+                ) as fused:
+                    out = block(x)
+                self.assertEqual(fused.call_count, 1)
+                with (
+                    patch.object(switch_layers, "can_combine", lambda *args: False),
+                    patch.object(module, "on_metal", lambda: False, create=True),
+                ):
+                    ref = block(x)
+                self._assert_close(out, ref, 3e-2)
 
     def test_post_expert_norm_combine(self):
         # fp32 only: in bf16 the kernel rounds after each expert.

@@ -58,7 +58,7 @@ _SOFTMAX_TOPK_SOURCE = """
     }
     if (lane == 0) {
         for (int k = 0; k < K; k++) {
-            weights[size_t(token) * K + k] = w[k] / total;
+            weights[size_t(token) * K + k] = static_cast<WT>(w[k] / total);
         }
     }
 """
@@ -72,14 +72,15 @@ _softmax_topk_kernel = mx.fast.metal_kernel(
 
 
 def softmax_topk(logits: mx.array, *, top_k: int, normalize: bool) -> list[mx.array]:
-    """The top ``top_k`` experts of each token and their softmax weights (float32),
-    renormalized over the top ``top_k`` if ``normalize``, from the router logits."""
+    """The top ``top_k`` experts of each token and their softmax weights, renormalized
+    over the top ``top_k`` if ``normalize``, from the router logits. The weights are
+    computed in float32 and returned in the dtype of ``logits``, as ``mx.softmax``."""
     E = logits.shape[-1]
     return _softmax_topk_kernel(
         inputs=[logits],
-        template=[("E", E), ("K", top_k), ("NORM", normalize)],
+        template=[("E", E), ("K", top_k), ("NORM", normalize), ("WT", logits.dtype)],
         grid=(logits.size // E * 32, 1, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[logits.shape[:-1] + (top_k,)] * 2,
-        output_dtypes=[mx.uint32, mx.float32],
+        output_dtypes=[mx.uint32, logits.dtype],
     )
