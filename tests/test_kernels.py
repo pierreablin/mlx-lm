@@ -1,5 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
+import itertools
 import unittest
 from unittest.mock import patch
 
@@ -7,6 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_lm.kernels import (
+    can_combine,
     expert_routing,
     norm_add_norm,
     post_expert_norm_combine,
@@ -14,9 +16,14 @@ from mlx_lm.kernels import (
     qk_norm,
     qk_norm_rope,
     rms_norm_sigmoid_gate,
+    softmax_topk,
     sparse_mla,
     sparse_mla_attention,
+    switch_glu_combine,
 )
+from mlx_lm.models import qwen3_moe
+from mlx_lm.models.cache import make_prompt_cache
+from mlx_lm.models.switch_layers import SwitchGLU
 
 TOL = {mx.float32: 1e-5, mx.bfloat16: 1e-2}
 
@@ -89,6 +96,61 @@ def _sparse_mla_ref(q, q_pe, kv, k_pe, idx, scale):
     probs = mx.softmax(scores, axis=-1)
     values = kv[rows].astype(mx.float32)  # [L, K, r]
     return (probs[..., None] * values[None]).sum(-2)  # [H, L, r]
+
+
+def _switch_glu(dims, hidden, experts, *, bits, group_size, dtype):
+    mx.random.seed(4)
+    switch_glu = SwitchGLU(dims, hidden, experts)
+    switch_glu.set_dtype(dtype)
+    nn.quantize(switch_glu, group_size=group_size, bits=bits)
+    switch_glu.eval()
+    return switch_glu
+
+
+def _switch_glu_combine_ref(switch_glu, x, inds, weights):
+    # The selected experts in fp32, from the dequantized weights.
+    def expert(proj, e):
+        w = mx.dequantize(
+            proj.weight[e], proj.scales[e], proj.biases[e], proj.group_size, proj.bits
+        )
+        return w.astype(mx.float32)
+
+    x = x.reshape(-1).astype(mx.float32)
+    y = mx.zeros_like(x)
+    for e, w in zip(inds.reshape(-1).tolist(), weights.reshape(-1).tolist()):
+        gate = expert(switch_glu.gate_proj, e) @ x
+        up = expert(switch_glu.up_proj, e) @ x
+        y = y + w * (expert(switch_glu.down_proj, e) @ (nn.silu(gate) * up))
+    return y
+
+
+def _tiny_qwen3_moe():
+    args = qwen3_moe.ModelArgs(
+        model_type="qwen3_moe",
+        hidden_size=128,
+        num_hidden_layers=2,
+        intermediate_size=256,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        rms_norm_eps=1e-6,
+        vocab_size=1000,
+        num_experts=16,
+        num_experts_per_tok=4,
+        decoder_sparse_step=1,
+        mlp_only_layers=[],
+        moe_intermediate_size=64,
+        rope_theta=10000.0,
+        tie_word_embeddings=False,
+        max_position_embeddings=512,
+        norm_topk_prob=True,
+    )
+    mx.random.seed(6)
+    model = qwen3_moe.Model(args)
+    model.set_dtype(mx.bfloat16)
+    nn.quantize(model, group_size=64, bits=4)
+    model.eval()
+    return model
 
 
 @unittest.skipIf(not mx.metal.is_available(), "The kernels need the Metal backend")
@@ -164,6 +226,77 @@ class TestKernels(unittest.TestCase):
         self.assertEqual(inds.dtype, mx.uint32)
         self.assertTrue(mx.array_equal(inds, ref_inds))
         self._assert_close(weights, ref_weights, TOL[mx.float32])
+
+    def test_softmax_topk(self):
+        mx.random.seed(5)
+        # E = 40 and 160 leave some SIMD lanes without an expert. No ties for this seed.
+        for E, k in ((40, 4), (128, 8), (160, 1)):
+            logits = 2 * mx.random.normal((2, 3, E))
+            probs = mx.softmax(logits, axis=-1)
+            ref_inds = mx.argsort(-probs, axis=-1)[..., :k]
+            for normalize in (True, False):
+                inds, weights = softmax_topk(logits, top_k=k, normalize=normalize)
+                ref_weights = mx.take_along_axis(probs, ref_inds, axis=-1)
+                if normalize:
+                    ref_weights = ref_weights / ref_weights.sum(-1, keepdims=True)
+                self.assertEqual(inds.dtype, mx.uint32)
+                self.assertTrue(mx.array_equal(inds, ref_inds))
+                self._assert_close(weights, ref_weights, TOL[mx.float32])
+
+    def test_switch_glu_combine(self):
+        # 640 values per row leave the last block of 512 partial; 384 is not a
+        # multiple of 512 either, so lanes straddle two experts' rows of the down
+        # projection.
+        dims, hidden, experts = 640, 384, 16
+        inds = mx.array([[[3, 11, 0, 7]]], dtype=mx.uint32)
+        weights = mx.array([[[0.4, 0.3, 0.2, 0.1]]])
+        for bits, group_size, dtype in itertools.product(
+            (4, 8), (32, 64, 128), (mx.bfloat16, mx.float16)
+        ):
+            switch_glu = _switch_glu(
+                dims, hidden, experts, bits=bits, group_size=group_size, dtype=dtype
+            )
+            x = mx.random.normal((1, 1, dims)).astype(dtype)
+            self.assertTrue(can_combine(switch_glu, x))
+            out = switch_glu_combine(switch_glu, x, inds, weights)
+            ref = _switch_glu_combine_ref(switch_glu, x, inds, weights)
+            self._assert_close(
+                out, ref.reshape(x.shape).astype(dtype), TOL[mx.bfloat16]
+            )
+
+    def test_can_combine(self):
+        x = mx.random.normal((1, 1, 512)).astype(mx.bfloat16)
+        switch_glu = _switch_glu(512, 256, 8, bits=4, group_size=64, dtype=mx.bfloat16)
+        self.assertTrue(can_combine(switch_glu, x))
+        self.assertFalse(can_combine(switch_glu, mx.concatenate([x, x], axis=1)))
+        self.assertFalse(can_combine(switch_glu, x.astype(mx.float32)))
+        with mx.stream(mx.cpu):
+            self.assertFalse(can_combine(switch_glu, x))
+        switch_glu.train()
+        self.assertFalse(can_combine(switch_glu, x))
+        for bits, dtype in ((3, mx.bfloat16), (4, mx.float32)):
+            other = _switch_glu(512, 256, 8, bits=bits, group_size=64, dtype=dtype)
+            self.assertFalse(can_combine(other, x))
+        unquantized = SwitchGLU(512, 256, 8)
+        unquantized.set_dtype(mx.bfloat16)
+        self.assertFalse(can_combine(unquantized, x))
+
+    def test_qwen3_moe_decode(self):
+        # A decode step with the fused routing and experts against the generic path,
+        # which rounds to bf16 in other places.
+        model = _tiny_qwen3_moe()
+        prompt = mx.random.randint(0, 1000, (1, 8))
+
+        def decode():
+            cache = make_prompt_cache(model)
+            model(prompt, cache=cache)
+            return model(mx.array([[5]]), cache=cache)
+
+        out = decode()
+        with patch.object(qwen3_moe, "can_combine", lambda *args: False):
+            ref = decode()
+        self._assert_close(out, ref, 3e-2)
+        self.assertTrue(mx.array_equal(out.argmax(-1), ref.argmax(-1)))
 
     def test_post_expert_norm_combine(self):
         # fp32 only: in bf16 the kernel rounds after each expert.

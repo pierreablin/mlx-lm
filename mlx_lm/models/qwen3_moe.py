@@ -7,6 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
+from ..kernels import can_combine, softmax_topk, switch_glu_combine
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .pipeline import PipelineMixin
@@ -132,6 +133,13 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             x = sum_gradients(self.sharding_group)(x)
 
         gates = self.gate(x)
+        if self.sharding_group is None and can_combine(self.switch_mlp, x):
+            # One token (decode): the routing and the experts' weighted sum in
+            # fused kernels.
+            inds, scores = softmax_topk(
+                gates, top_k=self.top_k, normalize=self.norm_topk_prob
+            )
+            return switch_glu_combine(self.switch_mlp, x, inds, scores)
         gates = mx.softmax(gates, axis=-1, precise=True)
 
         k = self.top_k
