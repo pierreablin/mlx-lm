@@ -34,6 +34,12 @@ class SwigluOAI(nn.Module):
         self._alpha = alpha
         self._limit = limit
 
+    @property
+    def metal_act(self):
+        # The activation in the fused Metal kernels (kernels/switch_glu.py), which
+        # have the default alpha and limit.
+        return 2 if (self._alpha, self._limit) == (1.702, 7.0) else None
+
     def __call__(self, x: mx.array, gate: mx.array) -> mx.array:
         return swiglu_oai(gate, x, alpha=self._alpha, limit=self._limit)
 

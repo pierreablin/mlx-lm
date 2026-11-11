@@ -60,6 +60,7 @@ from mlx_lm.models import (
     step3p5,
     switch_layers,
 )
+from mlx_lm.models.activations import SwigluOAI
 from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.models.switch_layers import SwiGLU, SwitchGLU
 
@@ -136,32 +137,61 @@ def _sparse_mla_ref(q, q_pe, kv, k_pe, idx, scale):
     return (probs[..., None] * values[None]).sum(-2)  # [H, L, r]
 
 
-def _switch_glu(dims, hidden, experts, *, bits, group_size, dtype, activation=None):
+def _switch_glu(
+    dims,
+    hidden,
+    experts,
+    *,
+    bits,
+    group_size,
+    dtype,
+    activation=None,
+    mode="affine",
+    bias=False,
+):
     mx.random.seed(4)
     # Not `activation or ...`: a module without parameters is an empty dict.
     if activation is None:
         activation = SwiGLU()
-    switch_glu = SwitchGLU(dims, hidden, experts, activation=activation)
+    switch_glu = SwitchGLU(dims, hidden, experts, activation=activation, bias=bias)
+    if bias:
+        for proj in (switch_glu.gate_proj, switch_glu.up_proj, switch_glu.down_proj):
+            proj.bias = 0.1 * mx.random.normal(proj.bias.shape)
     switch_glu.set_dtype(dtype)
-    nn.quantize(switch_glu, group_size=group_size, bits=bits)
+    nn.quantize(switch_glu, group_size=group_size, bits=bits, mode=mode)
     switch_glu.eval()
     return switch_glu
 
 
-def _switch_glu_combine_ref(switch_glu, x, inds, weights, act=nn.silu):
+def _swiglu(gate, up):
+    return nn.silu(gate) * up
+
+
+def _swiglu_oai(gate, up):
+    gate = mx.minimum(gate, 7.0)
+    return (mx.clip(up, -7.0, 7.0) + 1.0) * (gate * mx.sigmoid(1.702 * gate))
+
+
+def _switch_glu_combine_ref(switch_glu, x, inds, weights, glu=_swiglu):
     # The selected experts in fp32, from the dequantized weights.
-    def expert(proj, e):
+    def expert(proj, e, x):
         w = mx.dequantize(
-            proj.weight[e], proj.scales[e], proj.biases[e], proj.group_size, proj.bits
+            proj.weight[e],
+            proj.scales[e],
+            proj.biases[e] if "biases" in proj else None,
+            proj.group_size,
+            proj.bits,
+            mode=proj.mode,
         )
-        return w.astype(mx.float32)
+        y = w.astype(mx.float32) @ x
+        return y + proj.bias[e].astype(mx.float32) if "bias" in proj else y
 
     x = x.reshape(-1).astype(mx.float32)
     y = mx.zeros_like(x)
     for e, w in zip(inds.reshape(-1).tolist(), weights.reshape(-1).tolist()):
-        gate = expert(switch_glu.gate_proj, e) @ x
-        up = expert(switch_glu.up_proj, e) @ x
-        y = y + w * (expert(switch_glu.down_proj, e) @ (act(gate) * up))
+        gate = expert(switch_glu.gate_proj, e, x)
+        up = expert(switch_glu.up_proj, e, x)
+        y = y + w * expert(switch_glu.down_proj, e, glu(gate, up))
     return y
 
 
@@ -402,8 +432,12 @@ class TestKernels(unittest.TestCase):
         dims, hidden, experts = 640, 384, 16
         inds = mx.array([[[3, 11, 0, 7]]], dtype=mx.uint32)
         weights = mx.array([[[0.4, 0.3, 0.2, 0.1]]])
-        activations = ((SwiGLU(), nn.silu), (gemma4_text.GeGLU(), nn.gelu_approx))
-        for bits, group_size, dtype, (activation, act) in itertools.product(
+        activations = (
+            (SwiGLU(), _swiglu),
+            (gemma4_text.GeGLU(), lambda g, u: nn.gelu_approx(g) * u),
+            (SwigluOAI(), _swiglu_oai),
+        )
+        for bits, group_size, dtype, (activation, glu) in itertools.product(
             (4, 8), (32, 64, 128), (mx.bfloat16, mx.float16), activations
         ):
             switch_glu = _switch_glu(
@@ -417,13 +451,41 @@ class TestKernels(unittest.TestCase):
             )
             x = mx.random.normal((1, 1, dims)).astype(dtype)
             self.assertTrue(can_combine(switch_glu, x))
-            ref = _switch_glu_combine_ref(switch_glu, x, inds, weights, act)
+            ref = _switch_glu_combine_ref(switch_glu, x, inds, weights, glu)
             ref = ref.reshape(x.shape)
             # The output has the dtype of the weighted sum: float32 weights promote.
             for w in (weights, weights.astype(dtype)):
                 out = switch_glu_combine(switch_glu, x, inds, w)
                 ref_dtype = mx.result_type(dtype, w.dtype)
                 self._assert_close(out, ref.astype(ref_dtype), TOL[mx.bfloat16])
+
+    def test_switch_glu_combine_mxfp4(self):
+        # gpt-oss's experts: MXFP4 with biases. 640 and 384 values per row, as above.
+        dims, hidden, experts = 640, 384, 16
+        inds = mx.array([[[3, 11, 0, 7]]], dtype=mx.uint32)
+        weights = mx.array([[[0.4, 0.3, 0.2, 0.1]]])
+        activations = ((SwiGLU(), _swiglu), (SwigluOAI(), _swiglu_oai))
+        for dtype, (activation, glu) in itertools.product(
+            (mx.bfloat16, mx.float16), activations
+        ):
+            switch_glu = _switch_glu(
+                dims,
+                hidden,
+                experts,
+                bits=4,
+                group_size=32,
+                dtype=dtype,
+                activation=activation,
+                mode="mxfp4",
+                bias=True,
+            )
+            x = mx.random.normal((1, 1, dims)).astype(dtype)
+            self.assertTrue(can_combine(switch_glu, x))
+            ref = _switch_glu_combine_ref(switch_glu, x, inds, weights, glu)
+            for w in (weights, weights.astype(dtype)):
+                out = switch_glu_combine(switch_glu, x, inds, w)
+                ref_out = ref.reshape(x.shape).astype(mx.result_type(dtype, w.dtype))
+                self._assert_close(out, ref_out, TOL[mx.bfloat16])
 
     def test_can_combine(self):
         x = mx.random.normal((1, 1, 512)).astype(mx.bfloat16)
@@ -441,6 +503,30 @@ class TestKernels(unittest.TestCase):
         unquantized = SwitchGLU(512, 256, 8)
         unquantized.set_dtype(mx.bfloat16)
         self.assertFalse(can_combine(unquantized, x))
+        # MXFP4 experts need biases (gpt-oss), affine ones none.
+        for mode, group_size, bits in (("mxfp4", 32, 4), ("affine", 64, 4)):
+            for bias in (False, True):
+                other = _switch_glu(
+                    512,
+                    256,
+                    8,
+                    bits=bits,
+                    group_size=group_size,
+                    dtype=mx.bfloat16,
+                    mode=mode,
+                    bias=bias,
+                )
+                self.assertEqual(can_combine(other, x), bias == (mode == "mxfp4"))
+        oai = _switch_glu(
+            512,
+            256,
+            8,
+            bits=4,
+            group_size=64,
+            dtype=mx.bfloat16,
+            activation=SwigluOAI(alpha=1.5),
+        )
+        self.assertFalse(can_combine(oai, x))
 
     def test_qwen3_moe_decode(self):
         # A decode step with the fused routing and experts against the generic path,
@@ -534,16 +620,21 @@ class TestKernels(unittest.TestCase):
             ),
             (kimi_k3, kimi_k3.KimiK3SparseMoE, _MOE_ARGS, "expert_routing"),
             (gpt_oss, gpt_oss.MLPBlock, _MOE_ARGS, "softmax_topk"),
+            (gpt_oss, gpt_oss.MLPBlock, _MOE_ARGS, "softmax_topk", "mxfp4"),
             (longcat_flash, longcat_flash.LongcatFlashMoE, _MOE_ARGS, None),
         ]
-        # SwigluOAI and SiTU have no Metal kernel: only the routing is fused.
-        unfused = {minimax_m3_vl, kimi_k3, gpt_oss}
-        for module, block_cls, args, routing in blocks:
-            with self.subTest(module.__name__, n_group=args.n_group):
+        # SiTU has no Metal kernel, nor affine experts with biases: only the routing
+        # is fused.
+        unfused = {(kimi_k3, "affine"), (gpt_oss, "affine")}
+        for module, block_cls, args, routing, *mode in blocks:
+            mode = mode[0] if mode else "affine"
+            with self.subTest(module.__name__, n_group=args.n_group, mode=mode):
                 mx.random.seed(7)
                 block = block_cls(args)
                 block.set_dtype(mx.bfloat16)
-                nn.quantize(block, group_size=64, bits=4)
+                nn.quantize(
+                    block, group_size=64 if mode == "affine" else 32, bits=4, mode=mode
+                )
                 block.eval()
                 # A correction bias that changes which experts are picked.
                 for _, m in block.named_modules():
@@ -569,7 +660,7 @@ class TestKernels(unittest.TestCase):
                     ) as routed,
                 ):
                     out = block(x)
-                self.assertEqual(fused.call_count, 0 if module in unfused else 1)
+                self.assertEqual(fused.call_count, int((module, mode) not in unfused))
                 if routing:
                     self.assertEqual(routed.call_count, 1)
                 with (
