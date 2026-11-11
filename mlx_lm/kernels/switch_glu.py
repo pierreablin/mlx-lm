@@ -7,20 +7,44 @@ from functools import lru_cache
 
 import mlx.core as mx
 
-# x[16] as floats and their sum; for 4 bits, x[i] is prescaled by 1 / 16^(i % 4) so
-# that the masked nibbles of a uint16 need no shift (as mlx's qmv).
+# x[16] as floats and their sum. The weights of a row are a little-endian stream of
+# BITS-bit values; x[i] is prescaled by 2^-s, s the offset of value i's lowest bit in
+# the byte (uint16 for 4 bits) that qdot16 masks it from, so that the masked weights
+# need no shift (as mlx's qmv).
 _HEADER = """
+template <int BITS>
+inline float prescale(int i) {
+    if (BITS == 2) {
+        return 1.0f / float(1 << (2 * (i % 4)));
+    }
+    if (BITS == 3) {
+        constexpr int s[8] = {0, 3, 6, 1, 4, 7, 2, 5};
+        return 1.0f / float(1 << s[i % 8]);
+    }
+    if (BITS == 4) {
+        return 1.0f / float(1 << (4 * (i % 4)));
+    }
+    if (BITS == 5) {
+        constexpr int s[8] = {0, 5, 2, 7, 4, 1, 6, 3};
+        return 1.0f / float(1 << s[i % 8]);
+    }
+    if (BITS == 6) {
+        constexpr int s[4] = {0, 6, 4, 2};
+        return 1.0f / float(1 << s[i % 4]);
+    }
+    return 1.0f;
+}
+
 template <int BITS, typename U>
 inline float load16(const device U* x, thread float* xs) {
     float s = 0.0f;
     for (int i = 0; i < 16; i += 4) {
         float a = x[i], b = x[i + 1], c = x[i + 2], d = x[i + 3];
         s += a + b + c + d;
-        if (BITS == 4) {
-            xs[i] = a; xs[i + 1] = b / 16.0f; xs[i + 2] = c / 256.0f; xs[i + 3] = d / 4096.0f;
-        } else {
-            xs[i] = a; xs[i + 1] = b; xs[i + 2] = c; xs[i + 3] = d;
-        }
+        xs[i] = a * prescale<BITS>(i);
+        xs[i + 1] = b * prescale<BITS>(i + 1);
+        xs[i + 2] = c * prescale<BITS>(i + 2);
+        xs[i + 3] = d * prescale<BITS>(i + 3);
     }
     return s;
 }
@@ -36,7 +60,41 @@ inline float glu_act(float g) {
 template <int BITS>
 inline float qdot16(const device uint8_t* w, thread const float* xs) {
     float a = 0.0f;
-    if (BITS == 4) {
+    if (BITS == 2) {
+        for (int i = 0; i < 4; i++) {
+            uint8_t q = w[i];
+            a += xs[4 * i] * (q & 0x03) + xs[4 * i + 1] * (q & 0x0c) +
+                xs[4 * i + 2] * (q & 0x30) + xs[4 * i + 3] * (q & 0xc0);
+        }
+    } else if (BITS == 3) {
+        // Two packs of 8 values in 3 bytes; values 2 and 5 straddle two bytes.
+        for (int p = 0; p < 2; p++) {
+            auto q = w + 3 * p;
+            auto v = xs + 8 * p;
+            a += (q[0] & 0x07) * v[0] + (q[0] & 0x38) * v[1] + (q[0] & 0xc0) * v[2] +
+                (q[1] & 0x01) * (v[2] * 256.0f) + (q[1] & 0x0e) * v[3] + (q[1] & 0x70) * v[4] +
+                (q[1] & 0x80) * v[5] + (q[2] & 0x03) * (v[5] * 256.0f) + (q[2] & 0x1c) * v[6] +
+                (q[2] & 0xe0) * v[7];
+        }
+    } else if (BITS == 5) {
+        // Two packs of 8 values in 5 bytes.
+        for (int p = 0; p < 2; p++) {
+            auto q = w + 5 * p;
+            auto v = xs + 8 * p;
+            a += (q[0] & 0x1f) * v[0] + (q[0] & 0xe0) * v[1] + (q[1] & 0x03) * (v[1] * 256.0f) +
+                (q[1] & 0x7c) * v[2] + (q[1] & 0x80) * v[3] + (q[2] & 0x0f) * (v[3] * 256.0f) +
+                (q[2] & 0xf0) * v[4] + (q[3] & 0x01) * (v[4] * 256.0f) + (q[3] & 0x3e) * v[5] +
+                (q[3] & 0xc0) * v[6] + (q[4] & 0x07) * (v[6] * 256.0f) + (q[4] & 0xf8) * v[7];
+        }
+    } else if (BITS == 6) {
+        // Four packs of 4 values in 3 bytes.
+        for (int p = 0; p < 4; p++) {
+            auto q = w + 3 * p;
+            auto v = xs + 4 * p;
+            a += (q[0] & 0x3f) * v[0] + (q[0] & 0xc0) * v[1] + (q[1] & 0x0f) * (v[1] * 256.0f) +
+                (q[1] & 0xf0) * v[2] + (q[2] & 0x03) * (v[2] * 256.0f) + (q[2] & 0xfc) * v[3];
+        }
+    } else if (BITS == 4) {
         auto ws = (const device uint16_t*)w;
         for (int i = 0; i < 4; i++) {
             uint16_t q = ws[i];
@@ -151,7 +209,7 @@ _DOWN_SHAPE = (1, 4)
 def can_combine(switch_glu, x: mx.array) -> bool:
     """Whether ``switch_glu_combine`` takes ``x``: one token, bf16 or fp16, on Metal,
     not training, and a SwitchGLU whose activation has a ``metal_act`` (SwiGLU, GeGLU)
-    and whose experts are affine 4- or 8-bit (group size 32, 64 or 128, scales in the
+    and whose experts are affine 2- to 8-bit (group size 32, 64 or 128, scales in the
     dtype of ``x``, no bias)."""
     projs = (switch_glu.gate_proj, switch_glu.up_proj, switch_glu.down_proj)
     if not (
@@ -167,7 +225,7 @@ def can_combine(switch_glu, x: mx.array) -> bool:
         projs[0], "group_size", None
     )
     return (
-        bits in (4, 8)
+        bits in (2, 3, 4, 5, 6, 8)
         and group_size in (32, 64, 128)
         and all(
             getattr(p, "mode", None) == "affine"
