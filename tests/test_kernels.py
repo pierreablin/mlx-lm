@@ -27,6 +27,10 @@ from mlx_lm.kernels import (
 from mlx_lm.models import (
     Klear,
     afmoe,
+    bailing_hybrid,
+    bailing_moe,
+    bailing_moe_linear,
+    bailing_moe_v3,
     deepseek,
     deepseek_v2,
     deepseek_v3,
@@ -39,6 +43,7 @@ from mlx_lm.models import (
     granitemoehybrid,
     hunyuan,
     jamba,
+    kimi_k3,
     laguna,
     lfm2_moe,
     mellum,
@@ -198,6 +203,19 @@ _MOE_ARGS = SimpleNamespace(
     moe_routed_scaling_factor=2.5,
     moe_router_logit_softcapping=0.0,
     moe_router_score_func="sigmoid",
+    score_function="sigmoid",
+    moe_router_enable_expert_bias=True,
+    moe_router_enable_routed_scaling=True,
+    moe_router_enable_shared_expert=True,
+    moe_shared_expert_intermediate_size=64,
+    use_bias=False,
+    num_experts_per_token=4,
+    num_expert_group=4,
+    moe_renormalize=True,
+    routed_expert_hidden_size=None,
+    latent_moe_use_norm=False,
+    activation_situ_beta=1.0,
+    activation_situ_linear_beta=1.0,
 )
 
 
@@ -314,6 +332,39 @@ class TestKernels(unittest.TestCase):
         self.assertTrue(mx.array_equal(inds, ref_inds))
         self._assert_close(weights, ref_weights, TOL[mx.float32])
 
+    def test_expert_routing_groups(self):
+        # Groups of 8 experts (a lane holds experts of several groups) and of 32 (as
+        # DeepSeek-V3: a lane's i-th expert is in group i). The biases are positive so
+        # that no masked expert is picked, whatever the masked score. No ties for this
+        # seed.
+        mx.random.seed(8)
+        for E, G, TG, k in ((64, 8, 3, 6), (256, 8, 4, 8)):
+            logits = 2 * mx.random.normal((2, 3, E))
+            bias = 0.2 * mx.random.uniform(shape=(E,))
+            scores = mx.sigmoid(logits)
+            biased = scores + bias
+            top2 = mx.sort(mx.unflatten(biased, -1, (G, E // G)), axis=-1)[..., -2:]
+            kept = mx.argsort(-top2.sum(-1), axis=-1)[..., :TG]
+            in_kept = (mx.arange(E) // (E // G))[:, None] == kept[..., None, :]
+            biased = mx.where(in_kept.any(-1), biased, -1.0)
+            ref_inds = mx.argsort(-biased, axis=-1)[..., :k]
+            ref_weights = mx.take_along_axis(scores, ref_inds, axis=-1)
+            ref_weights = ref_weights / ref_weights.sum(-1, keepdims=True) * 2.5
+            for masked in (0.0, -float("inf")):
+                inds, weights = expert_routing(
+                    logits,
+                    bias,
+                    top_k=k,
+                    multiplier=1.0,
+                    score_eps=0.0,
+                    route_scale=2.5,
+                    n_group=G,
+                    topk_group=TG,
+                    masked_score=masked,
+                )
+                self.assertTrue(mx.array_equal(inds, ref_inds))
+                self._assert_close(weights, ref_weights, TOL[mx.float32])
+
     def test_softmax_topk(self):
         mx.random.seed(5)
         # E = 40 and 160 leave some SIMD lanes without an expert. No ties for this seed.
@@ -407,8 +458,7 @@ class TestKernels(unittest.TestCase):
 
     def test_moe_blocks(self):
         # Each model's MoE block on one token, its routing kernel and SwitchGLU.combine
-        # against the generic path. With groups masked out (n_group 4, topk_group 2),
-        # DeepSeek-V3's routing has no kernel.
+        # against the generic path; _MOE_ARGS masks 2 groups of 4 experts out of 4.
         ungrouped = SimpleNamespace(
             **{**vars(_MOE_ARGS), "n_group": 1, "topk_group": 1}
         )
@@ -419,7 +469,7 @@ class TestKernels(unittest.TestCase):
             (mixtral, mixtral.MixtralSparseMoeBlock, _MOE_ARGS, "softmax_topk"),
             (olmoe, olmoe.OlmoeSparseMoeBlock, _MOE_ARGS, "softmax_topk"),
             (gemma4_text, _Gemma4MoE, _MOE_ARGS, "softmax_topk"),
-            (deepseek_v3, deepseek_v3.DeepseekV3MoE, _MOE_ARGS, None),
+            (deepseek_v3, deepseek_v3.DeepseekV3MoE, _MOE_ARGS, "expert_routing"),
             (deepseek_v3, deepseek_v3.DeepseekV3MoE, ungrouped, "expert_routing"),
             (deepseek_v32, deepseek_v32.DeepseekV32MoE, ungrouped, "expert_routing"),
             (glm4_moe, glm4_moe.MoE, ungrouped, "expert_routing"),
@@ -450,9 +500,36 @@ class TestKernels(unittest.TestCase):
             (Klear, Klear.KlearSparseMoeBlock, _MOE_ARGS, "expert_routing"),
             (minimax_m3_vl, minimax_m3_vl.SparseMoeBlock, _MOE_ARGS, "expert_routing"),
             (laguna, laguna.MoE, _MOE_ARGS, "expert_routing"),
+            (afmoe, afmoe.AfmoeMoE, _MOE_ARGS, "expert_routing"),
+            (dots1, dots1.Dots1MoE, _MOE_ARGS, "expert_routing"),
+            (
+                bailing_moe,
+                bailing_moe.BailingMoeSparseMoeBlock,
+                _MOE_ARGS,
+                "expert_routing",
+            ),
+            (
+                bailing_moe_linear,
+                bailing_moe_linear.SparseMoeBlock,
+                _MOE_ARGS,
+                "expert_routing",
+            ),
+            (
+                bailing_hybrid,
+                bailing_hybrid.SparseMoeBlock,
+                _MOE_ARGS,
+                "expert_routing",
+            ),
+            (
+                bailing_moe_v3,
+                bailing_moe_v3.BailingSparseMoE,
+                _MOE_ARGS,
+                "expert_routing",
+            ),
+            (kimi_k3, kimi_k3.KimiK3SparseMoE, _MOE_ARGS, "expert_routing"),
         ]
-        # SwigluOAI has no Metal kernel: only the routing is fused.
-        unfused = {minimax_m3_vl}
+        # SwigluOAI and SiTU have no Metal kernel: only the routing is fused.
+        unfused = {minimax_m3_vl, kimi_k3}
         for module, block_cls, args, routing in blocks:
             with self.subTest(module.__name__, n_group=args.n_group):
                 mx.random.seed(7)

@@ -182,14 +182,8 @@ class MoEGate(nn.Module):
 
     def __call__(self, x):
         gates = x @ self.weight.T
-        if (
-            not self.training
-            and on_metal()
-            and self.top_k > 1
-            and self.norm_topk_prob
-            and self.topk_group >= self.n_group
-        ):
-            # No group masked out: group_expert_select's routing in one kernel.
+        if not self.training and on_metal() and self.top_k > 1 and self.norm_topk_prob:
+            # group_expert_select's routing in one kernel.
             return expert_routing(
                 gates,
                 self.e_score_correction_bias,
@@ -197,6 +191,8 @@ class MoEGate(nn.Module):
                 multiplier=1.0,
                 score_eps=0.0,
                 route_scale=self.routed_scaling_factor,
+                n_group=self.n_group,
+                topk_group=self.topk_group,
             )
         return group_expert_select(
             gates,

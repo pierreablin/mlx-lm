@@ -238,11 +238,10 @@ class AfmoeMoE(nn.Module):
             not self.training
             and on_metal()
             and self.score_func == "sigmoid"
-            and self.topk_group >= self.n_group
             and self.route_norm
             and k > 1
         ):
-            # No group masked out: _route in one kernel.
+            # _route in one kernel.
             inds, selected_scores = expert_routing(
                 gates,
                 self.expert_bias,
@@ -250,6 +249,8 @@ class AfmoeMoE(nn.Module):
                 multiplier=1.0,
                 score_eps=0.0,
                 route_scale=self.route_scale,
+                n_group=self.n_group,
+                topk_group=self.topk_group,
             )
         else:
             inds, selected_scores = self._route(gates)
