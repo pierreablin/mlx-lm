@@ -261,10 +261,9 @@ _down_mxfp4_kernel = mx.fast.metal_kernel(
 )
 
 # Rows per simdgroup and simdgroups per threadgroup, the fastest of those tried
-# with Qwen3-30B-A3B's experts (D = 2048, N = 768), and for MXFP4 with gpt-oss-20b's
-# (D = N = 2880).
-_GATE_UP_SHAPE = (2, 2)
-_GATE_UP_MXFP4_SHAPE = (1, 4)
+# with the experts of ten MoE models (D from 1536 to 2816, N from 512 to 1792),
+# and of gpt-oss-20b in MXFP4 (D = N = 2880).
+_GATE_UP_SHAPE = (1, 2)
 _DOWN_SHAPE = (1, 4)
 
 
@@ -339,7 +338,7 @@ def _combine_fn(act: int, mode: str, group_size: int, bits: int):
             ("GS", group_size),
             ("BITS", bits),
         ]
-        rps, spt = _GATE_UP_MXFP4_SHAPE if mxfp4 else _GATE_UP_SHAPE
+        rps, spt = _GATE_UP_SHAPE
         tpe = -(-N // (rps * spt))
         h = (_gate_up_mxfp4_kernel if mxfp4 else _gate_up_kernel)(
             inputs=[x, inds, weights, gw, gs, gb, uw, us, ub],
