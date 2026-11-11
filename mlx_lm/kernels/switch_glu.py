@@ -143,8 +143,8 @@ _down_kernel = mx.fast.metal_kernel(
 )
 
 # Rows per simdgroup and simdgroups per threadgroup, the fastest of those tried
-# with Qwen3-30B-A3B's experts (D = 2048, N = 768).
-_GATE_UP_SHAPE = (2, 2)
+# with the experts of ten MoE models (D from 1536 to 2816, N from 512 to 1792).
+_GATE_UP_SHAPE = (1, 2)
 _DOWN_SHAPE = (1, 4)
 
 
