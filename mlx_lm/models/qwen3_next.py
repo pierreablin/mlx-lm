@@ -337,12 +337,13 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             if self.norm_topk_prob:
                 scores = scores / scores.sum(axis=-1, keepdims=True)
 
-        y = self.switch_mlp.combine(x, inds, scores)
-
-        shared_y = self.shared_expert(x)
-        shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
-
-        y = y + shared_y
+        y = self.switch_mlp.combine(
+            x,
+            inds,
+            scores,
+            shared=self.shared_expert,
+            shared_gate=self.shared_expert_gate,
+        )
 
         if self.sharding_group is not None:
             y = mx.distributed.all_sum(y, group=self.sharding_group)

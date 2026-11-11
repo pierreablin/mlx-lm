@@ -223,13 +223,18 @@ class SwitchGLU(nn.Module):
 
         return x.squeeze(-2)
 
-    def combine(self, x, indices, scores) -> mx.array:
+    def combine(self, x, indices, scores, shared=None, shared_gate=None) -> mx.array:
         """The experts' outputs weighted by ``scores`` and summed over the experts,
-        ``(self(x, indices) * scores[..., None]).sum(axis=-2)``: in fused Metal kernels
-        for one token where they apply (``kernels.can_combine``)."""
-        if can_combine(self, x):
-            return switch_glu_combine(self, x, indices, scores)
-        return (self(x, indices) * scores[..., None]).sum(axis=-2)
+        ``(self(x, indices) * scores[..., None]).sum(axis=-2)``, plus
+        ``mx.sigmoid(shared_gate(x)) * shared(x)`` with a gated ``shared`` expert (a
+        GLU MLP with this activation): in fused Metal kernels for one token where they
+        apply (``kernels.can_combine``)."""
+        if can_combine(self, x, shared):
+            return switch_glu_combine(self, x, indices, scores, shared, shared_gate)
+        y = (self(x, indices) * scores[..., None]).sum(axis=-2)
+        if shared is not None:
+            y = y + mx.sigmoid(shared_gate(x)) * shared(x)
+        return y
 
 
 class SwitchMLP(nn.Module):

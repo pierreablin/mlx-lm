@@ -128,20 +128,23 @@ def _switch_glu(dims, hidden, experts, *, bits, group_size, dtype, activation=No
     return switch_glu
 
 
+def _dequantized(proj, e=None):
+    # A projection's weights in fp32, or those of expert e.
+    w, scales, biases = proj.weight, proj.scales, proj.biases
+    if e is not None:
+        w, scales, biases = w[e], scales[e], biases[e]
+    w = mx.dequantize(w, scales, biases, proj.group_size, proj.bits)
+    return w.astype(mx.float32)
+
+
 def _switch_glu_combine_ref(switch_glu, x, inds, weights, act=nn.silu):
     # The selected experts in fp32, from the dequantized weights.
-    def expert(proj, e):
-        w = mx.dequantize(
-            proj.weight[e], proj.scales[e], proj.biases[e], proj.group_size, proj.bits
-        )
-        return w.astype(mx.float32)
-
     x = x.reshape(-1).astype(mx.float32)
     y = mx.zeros_like(x)
     for e, w in zip(inds.reshape(-1).tolist(), weights.reshape(-1).tolist()):
-        gate = expert(switch_glu.gate_proj, e) @ x
-        up = expert(switch_glu.up_proj, e) @ x
-        y = y + w * (expert(switch_glu.down_proj, e) @ (act(gate) * up))
+        gate = _dequantized(switch_glu.gate_proj, e) @ x
+        up = _dequantized(switch_glu.up_proj, e) @ x
+        y = y + w * (_dequantized(switch_glu.down_proj, e) @ (act(gate) * up))
     return y
 
 
@@ -336,11 +339,50 @@ class TestKernels(unittest.TestCase):
                 ref_dtype = mx.result_type(dtype, w.dtype)
                 self._assert_close(out, ref.astype(ref_dtype), TOL[mx.bfloat16])
 
+    def test_switch_glu_combine_shared(self):
+        # 3 experts of 384 rows then a shared expert of 256: lanes straddle the two in
+        # the down projection, and its last block of 512 values is partial.
+        dims, hidden, shared_hidden, experts = 640, 384, 256, 16
+        inds = mx.array([[[3, 11, 0]]], dtype=mx.uint32)
+        weights = mx.array([[[0.5, 0.3, 0.2]]])
+        for bits, group_size, dtype in itertools.product(
+            (4, 8), (32, 64, 128), (mx.bfloat16, mx.float16)
+        ):
+            switch_glu = _switch_glu(
+                dims, hidden, experts, bits=bits, group_size=group_size, dtype=dtype
+            )
+            shared = qwen3_next.Qwen3NextMLP(dims, shared_hidden)
+            shared_gate = nn.Linear(dims, 1, bias=False)
+            for module, module_bits in ((shared, bits), (shared_gate, 8)):
+                module.set_dtype(dtype)
+                nn.quantize(module, group_size=group_size, bits=module_bits)
+            x = mx.random.normal((1, 1, dims)).astype(dtype)
+            self.assertTrue(can_combine(switch_glu, x, shared))
+
+            xf = x.reshape(-1).astype(mx.float32)
+            gate = _dequantized(shared.gate_proj) @ xf
+            up = _dequantized(shared.up_proj) @ xf
+            ref = _dequantized(shared.down_proj) @ (nn.silu(gate) * up)
+            ref = mx.sigmoid(shared_gate(x).astype(mx.float32)).reshape(()) * ref
+            ref = ref + _switch_glu_combine_ref(switch_glu, x, inds, weights)
+            for w in (weights, weights.astype(dtype)):
+                out = switch_glu_combine(switch_glu, x, inds, w, shared, shared_gate)
+                ref_dtype = mx.result_type(dtype, w.dtype)
+                ref_out = ref.reshape(x.shape).astype(ref_dtype)
+                self._assert_close(out, ref_out, TOL[mx.bfloat16])
+
     def test_can_combine(self):
         x = mx.random.normal((1, 1, 512)).astype(mx.bfloat16)
         switch_glu = _switch_glu(512, 256, 8, bits=4, group_size=64, dtype=mx.bfloat16)
         self.assertTrue(can_combine(switch_glu, x))
         self.assertFalse(can_combine(switch_glu, mx.concatenate([x, x], axis=1)))
+        # A shared expert must be quantized as the experts.
+        for bits in (None, 4, 8):
+            shared = qwen3_next.Qwen3NextMLP(512, 128)
+            shared.set_dtype(mx.bfloat16)
+            if bits is not None:
+                nn.quantize(shared, group_size=64, bits=bits)
+            self.assertEqual(can_combine(switch_glu, x, shared), bits == 4)
         self.assertFalse(can_combine(switch_glu, x.astype(mx.float32)))
         with mx.stream(mx.cpu):
             self.assertFalse(can_combine(switch_glu, x))

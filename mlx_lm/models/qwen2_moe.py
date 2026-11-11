@@ -138,14 +138,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             inds = mx.stop_gradient(inds)
             scores = mx.take_along_axis(gates, inds, axis=-1)
 
-        y = self.switch_mlp.combine(x, inds, scores)
-
-        shared_expert_output = self.shared_expert(x)
-        shared_expert_output = (
-            mx.sigmoid(self.shared_expert_gate(x)) * shared_expert_output
+        return self.switch_mlp.combine(
+            x,
+            inds,
+            scores,
+            shared=self.shared_expert,
+            shared_gate=self.shared_expert_gate,
         )
-
-        return y + shared_expert_output
 
 
 class Qwen2MoeDecoderLayer(nn.Module):
