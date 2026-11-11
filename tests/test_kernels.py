@@ -3,6 +3,7 @@
 import itertools
 import unittest
 from contextlib import nullcontext
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -24,20 +25,32 @@ from mlx_lm.kernels import (
     switch_glu_combine,
 )
 from mlx_lm.models import (
+    Klear,
+    afmoe,
+    deepseek,
+    deepseek_v2,
     deepseek_v3,
     deepseek_v32,
+    dots1,
     exaone_moe,
     gemma4_text,
     glm4_moe,
     glm4_moe_lite,
+    granitemoehybrid,
+    hunyuan,
+    jamba,
+    laguna,
     lfm2_moe,
+    mellum,
     mimo_v2_flash,
     minimax,
+    minimax_m3_vl,
     mixtral,
     olmoe,
     qwen2_moe,
     qwen3_moe,
     qwen3_next,
+    step3p5,
     switch_layers,
 )
 from mlx_lm.models.cache import make_prompt_cache
@@ -166,6 +179,25 @@ _MOE_ARGS = SimpleNamespace(
     n_group=4,
     topk_group=2,
     topk_method="noaux_tc",
+    score_func="sigmoid",
+    route_norm=True,
+    route_scale=2.5,
+    moe_topk=4,
+    num_shared_expert=1,
+    use_mixed_mlp_moe=True,
+    moe_num_experts=16,
+    moe_top_k=4,
+    moe_router_scaling_factor=2.5,
+    norm_expert_weight=True,
+    share_expert_dim=64,
+    swiglu_limits=None,
+    swiglu_limits_shared=None,
+    shared_intermediate_size=64,
+    swiglu_alpha=1.702,
+    swiglu_limit=7.0,
+    moe_routed_scaling_factor=2.5,
+    moe_router_logit_softcapping=0.0,
+    moe_router_score_func="sigmoid",
 )
 
 
@@ -380,6 +412,7 @@ class TestKernels(unittest.TestCase):
         ungrouped = SimpleNamespace(
             **{**vars(_MOE_ARGS), "n_group": 1, "topk_group": 1}
         )
+        greedy = SimpleNamespace(**{**vars(_MOE_ARGS), "topk_method": "greedy"})
         blocks = [
             (qwen3_next, qwen3_next.Qwen3NextSparseMoeBlock, _MOE_ARGS, "softmax_topk"),
             (qwen2_moe, qwen2_moe.Qwen2MoeSparseMoeBlock, _MOE_ARGS, "softmax_topk"),
@@ -395,7 +428,31 @@ class TestKernels(unittest.TestCase):
             (mimo_v2_flash, mimo_v2_flash.MoE, ungrouped, "expert_routing"),
             (minimax, minimax.MiniMaxSparseMoeBlock, _MOE_ARGS, "expert_routing"),
             (lfm2_moe, lfm2_moe.Lfm2MoeSparseMoeBlock, _MOE_ARGS, "expert_routing"),
+            (
+                granitemoehybrid,
+                granitemoehybrid.GraniteMoeHybridMoE,
+                _MOE_ARGS,
+                "softmax_topk",
+            ),
+            (jamba, jamba.JambaSparseMoeBlock, _MOE_ARGS, "softmax_topk"),
+            (hunyuan, hunyuan.MoeBlock, _MOE_ARGS, "softmax_topk"),
+            (mellum, mellum.MellumSparseMoeBlock, _MOE_ARGS, "softmax_topk"),
+            (deepseek, deepseek.DeepseekMoE, _MOE_ARGS, "softmax_topk"),
+            (deepseek_v2, deepseek_v2.DeepseekV2MoE, greedy, "softmax_topk"),
+            (afmoe, afmoe.AfmoeMoE, ungrouped, "expert_routing"),
+            (dots1, dots1.Dots1MoE, ungrouped, "expert_routing"),
+            (
+                step3p5,
+                partial(step3p5.Step3p5MoE, layer_idx=0),
+                _MOE_ARGS,
+                "expert_routing",
+            ),
+            (Klear, Klear.KlearSparseMoeBlock, _MOE_ARGS, "expert_routing"),
+            (minimax_m3_vl, minimax_m3_vl.SparseMoeBlock, _MOE_ARGS, "expert_routing"),
+            (laguna, laguna.MoE, _MOE_ARGS, "expert_routing"),
         ]
+        # SwigluOAI has no Metal kernel: only the routing is fused.
+        unfused = {minimax_m3_vl}
         for module, block_cls, args, routing in blocks:
             with self.subTest(module.__name__, n_group=args.n_group):
                 mx.random.seed(7)
@@ -405,7 +462,11 @@ class TestKernels(unittest.TestCase):
                 block.eval()
                 # A correction bias that changes which experts are picked.
                 for _, m in block.named_modules():
-                    for name in ("e_score_correction_bias", "expert_bias"):
+                    for name in (
+                        "e_score_correction_bias",
+                        "expert_bias",
+                        "router_bias",
+                    ):
                         if name in m:
                             m[name] = 0.1 * mx.random.normal(m[name].shape)
                 x = mx.random.normal((1, 1, 128)).astype(mx.bfloat16)
@@ -423,7 +484,7 @@ class TestKernels(unittest.TestCase):
                     ) as routed,
                 ):
                     out = block(x)
-                self.assertEqual(fused.call_count, 1)
+                self.assertEqual(fused.call_count, 0 if module in unfused else 1)
                 if routing:
                     self.assertEqual(routed.call_count, 1)
                 with (
