@@ -6,6 +6,7 @@ from typing import Any, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..kernels import expert_routing, on_metal
 from .activations import swiglu
 from .base import (
     BaseModelArgs,
@@ -213,9 +214,25 @@ class Lfm2MoeSparseMoeBlock(nn.Module):
         # the expert_bias is used only to select the top-k experts; the routing
         # weights are gathered from the unbiased sigmoid scores and then scaled by
         # routed_scaling_factor.
-        routing_weights = mx.sigmoid(self.gate(x))
-
+        gates = self.gate(x)
         k = self.top_k
+        if (
+            not self.training
+            and on_metal()
+            and self.use_expert_bias
+            and self.norm_topk_prob
+        ):
+            inds, scores = expert_routing(
+                gates,
+                self.expert_bias,
+                top_k=k,
+                multiplier=1.0,
+                score_eps=1e-6,
+                route_scale=self.routed_scaling_factor,
+            )
+            return self.switch_mlp.combine(x, inds, scores.astype(x.dtype))
+        routing_weights = mx.sigmoid(gates)
+
         if self.use_expert_bias:
             scores_for_routing = routing_weights.astype(mx.float32) + self.expert_bias
             inds = mx.argpartition(scores_for_routing, kth=-k, axis=-1)[..., -k:]

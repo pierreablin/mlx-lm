@@ -3,6 +3,8 @@
 """A quantized SwitchGLU for one token, with its experts' outputs weighted and
 summed, in two kernels."""
 
+from functools import lru_cache
+
 import mlx.core as mx
 
 # x[16] as floats and their sum; for 4 bits, x[i] is prescaled by 1 / 16^(i % 4) so
@@ -183,6 +185,49 @@ def can_combine(switch_glu, x: mx.array) -> bool:
     )
 
 
+@lru_cache
+def _combine_fn(act: int, group_size: int, bits: int):
+    """The two kernels for one configuration, compiled: shapes come from the inputs, so a
+    model's layers share one compiled function, and a call costs less on the host."""
+
+    def combine(x, inds, weights, gw, gs, gb, uw, us, ub, dw, ds, db):
+        K, N, D = inds.size, gw.shape[1], x.shape[-1]
+        inds = inds.reshape(-1).astype(mx.uint32)
+        weights = weights.reshape(-1)
+        out_dtype = mx.result_type(x.dtype, weights.dtype)
+        template = [
+            ("T", x.dtype),
+            ("O", out_dtype),
+            ("ACT", act),
+            ("D", D),
+            ("N", N),
+            ("K", K),
+            ("GS", group_size),
+            ("BITS", bits),
+        ]
+        rps, spt = _GATE_UP_SHAPE
+        tpe = -(-N // (rps * spt))
+        h = _gate_up_kernel(
+            inputs=[x, inds, weights, gw, gs, gb, uw, us, ub],
+            template=template + [("RPS", rps), ("SPT", spt)],
+            grid=(K * tpe * 32 * spt, 1, 1),
+            threadgroup=(32 * spt, 1, 1),
+            output_shapes=[(K, N)],
+            output_dtypes=[x.dtype],
+        )[0]
+        rps, spt = _DOWN_SHAPE
+        return _down_kernel(
+            inputs=[h, inds, dw, ds, db],
+            template=template + [("RPS", rps), ("SPT", spt)],
+            grid=(-(-D // (rps * spt)) * 32 * spt, 1, 1),
+            threadgroup=(32 * spt, 1, 1),
+            output_shapes=[x.shape],
+            output_dtypes=[out_dtype],
+        )[0]
+
+    return mx.compile(combine)
+
+
 def switch_glu_combine(
     switch_glu, x: mx.array, inds: mx.array, weights: mx.array
 ) -> mx.array:
@@ -190,46 +235,18 @@ def switch_glu_combine(
     ``weights``: ``(switch_glu(x, inds) * weights[..., None]).sum(-2)`` and of its
     dtype, in two kernels. Needs ``can_combine(switch_glu, x)``."""
     gp, up, dp = switch_glu.gate_proj, switch_glu.up_proj, switch_glu.down_proj
-    K, N, D = inds.size, gp.weight.shape[1], x.shape[-1]
-    inds = inds.reshape(-1).astype(mx.uint32)
-    weights = weights.reshape(-1)
-    out_dtype = mx.result_type(x.dtype, weights.dtype)
-    template = [
-        ("T", x.dtype),
-        ("O", out_dtype),
-        ("ACT", switch_glu.activation.metal_act),
-        ("D", D),
-        ("N", N),
-        ("K", K),
-        ("GS", gp.group_size),
-        ("BITS", gp.bits),
-    ]
-    rps, spt = _GATE_UP_SHAPE
-    tpe = -(-N // (rps * spt))
-    h = _gate_up_kernel(
-        inputs=[
-            x,
-            inds,
-            weights,
-            gp.weight,
-            gp.scales,
-            gp.biases,
-            up.weight,
-            up.scales,
-            up.biases,
-        ],
-        template=template + [("RPS", rps), ("SPT", spt)],
-        grid=(K * tpe * 32 * spt, 1, 1),
-        threadgroup=(32 * spt, 1, 1),
-        output_shapes=[(K, N)],
-        output_dtypes=[x.dtype],
-    )[0]
-    rps, spt = _DOWN_SHAPE
-    return _down_kernel(
-        inputs=[h, inds, dp.weight, dp.scales, dp.biases],
-        template=template + [("RPS", rps), ("SPT", spt)],
-        grid=(-(-D // (rps * spt)) * 32 * spt, 1, 1),
-        threadgroup=(32 * spt, 1, 1),
-        output_shapes=[x.shape],
-        output_dtypes=[out_dtype],
-    )[0]
+    fn = _combine_fn(switch_glu.activation.metal_act, gp.group_size, gp.bits)
+    return fn(
+        x,
+        inds,
+        weights,
+        gp.weight,
+        gp.scales,
+        gp.biases,
+        up.weight,
+        up.scales,
+        up.biases,
+        dp.weight,
+        dp.scales,
+        dp.biases,
+    )

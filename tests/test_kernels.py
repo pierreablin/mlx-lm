@@ -2,6 +2,7 @@
 
 import itertools
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -24,8 +25,14 @@ from mlx_lm.kernels import (
 )
 from mlx_lm.models import (
     deepseek_v3,
+    deepseek_v32,
+    exaone_moe,
     gemma4_text,
+    glm4_moe,
+    glm4_moe_lite,
     lfm2_moe,
+    mimo_v2_flash,
+    minimax,
     mixtral,
     olmoe,
     qwen2_moe,
@@ -151,6 +158,7 @@ _MOE_ARGS = SimpleNamespace(
     norm_topk_prob=True,
     shared_expert_intermediate_size=64,
     n_shared_experts=1,
+    num_shared_experts=1,
     mlp_bias=False,
     rms_norm_eps=1e-6,
     routed_scaling_factor=2.5,
@@ -366,32 +374,58 @@ class TestKernels(unittest.TestCase):
         self.assertTrue(mx.array_equal(out.argmax(-1), ref.argmax(-1)))
 
     def test_moe_blocks(self):
-        # Each model's MoE block on one token: its routing (the softmax_topk kernel
-        # where the model uses it) and SwitchGLU.combine, against the generic path.
-        blocks = {
-            qwen3_next: qwen3_next.Qwen3NextSparseMoeBlock,
-            qwen2_moe: qwen2_moe.Qwen2MoeSparseMoeBlock,
-            mixtral: mixtral.MixtralSparseMoeBlock,
-            olmoe: olmoe.OlmoeSparseMoeBlock,
-            deepseek_v3: deepseek_v3.DeepseekV3MoE,
-            lfm2_moe: lfm2_moe.Lfm2MoeSparseMoeBlock,
-            gemma4_text: _Gemma4MoE,
-        }
-        for module, block_cls in blocks.items():
-            with self.subTest(module.__name__):
+        # Each model's MoE block on one token, its routing kernel and SwitchGLU.combine
+        # against the generic path. With groups masked out (n_group 4, topk_group 2),
+        # DeepSeek-V3's routing has no kernel.
+        ungrouped = SimpleNamespace(
+            **{**vars(_MOE_ARGS), "n_group": 1, "topk_group": 1}
+        )
+        blocks = [
+            (qwen3_next, qwen3_next.Qwen3NextSparseMoeBlock, _MOE_ARGS, "softmax_topk"),
+            (qwen2_moe, qwen2_moe.Qwen2MoeSparseMoeBlock, _MOE_ARGS, "softmax_topk"),
+            (mixtral, mixtral.MixtralSparseMoeBlock, _MOE_ARGS, "softmax_topk"),
+            (olmoe, olmoe.OlmoeSparseMoeBlock, _MOE_ARGS, "softmax_topk"),
+            (gemma4_text, _Gemma4MoE, _MOE_ARGS, "softmax_topk"),
+            (deepseek_v3, deepseek_v3.DeepseekV3MoE, _MOE_ARGS, None),
+            (deepseek_v3, deepseek_v3.DeepseekV3MoE, ungrouped, "expert_routing"),
+            (deepseek_v32, deepseek_v32.DeepseekV32MoE, ungrouped, "expert_routing"),
+            (glm4_moe, glm4_moe.MoE, ungrouped, "expert_routing"),
+            (glm4_moe_lite, glm4_moe_lite.Glm4MoeLiteMoE, ungrouped, "expert_routing"),
+            (exaone_moe, exaone_moe.MoE, ungrouped, "expert_routing"),
+            (mimo_v2_flash, mimo_v2_flash.MoE, ungrouped, "expert_routing"),
+            (minimax, minimax.MiniMaxSparseMoeBlock, _MOE_ARGS, "expert_routing"),
+            (lfm2_moe, lfm2_moe.Lfm2MoeSparseMoeBlock, _MOE_ARGS, "expert_routing"),
+        ]
+        for module, block_cls, args, routing in blocks:
+            with self.subTest(module.__name__, n_group=args.n_group):
                 mx.random.seed(7)
-                block = block_cls(_MOE_ARGS)
+                block = block_cls(args)
                 block.set_dtype(mx.bfloat16)
                 nn.quantize(block, group_size=64, bits=4)
                 block.eval()
+                # A correction bias that changes which experts are picked.
+                for _, m in block.named_modules():
+                    for name in ("e_score_correction_bias", "expert_bias"):
+                        if name in m:
+                            m[name] = 0.1 * mx.random.normal(m[name].shape)
                 x = mx.random.normal((1, 1, 128)).astype(mx.bfloat16)
-                with patch.object(
-                    switch_layers,
-                    "switch_glu_combine",
-                    wraps=switch_layers.switch_glu_combine,
-                ) as fused:
+                kernel = getattr(module, routing) if routing else None
+                with (
+                    patch.object(
+                        switch_layers,
+                        "switch_glu_combine",
+                        wraps=switch_layers.switch_glu_combine,
+                    ) as fused,
+                    (
+                        patch.object(module, routing, wraps=kernel)
+                        if routing
+                        else nullcontext()
+                    ) as routed,
+                ):
                     out = block(x)
                 self.assertEqual(fused.call_count, 1)
+                if routing:
+                    self.assertEqual(routed.call_count, 1)
                 with (
                     patch.object(switch_layers, "can_combine", lambda *args: False),
                     patch.object(module, "on_metal", lambda: False, create=True),
