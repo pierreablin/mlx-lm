@@ -438,7 +438,7 @@ class TestKernels(unittest.TestCase):
             (SwigluOAI(), _swiglu_oai),
         )
         for bits, group_size, dtype, (activation, glu) in itertools.product(
-            (4, 8), (32, 64, 128), (mx.bfloat16, mx.float16), activations
+            (2, 3, 4, 5, 6, 8), (32, 64, 128), (mx.bfloat16, mx.float16), activations
         ):
             switch_glu = _switch_glu(
                 dims,
@@ -497,7 +497,7 @@ class TestKernels(unittest.TestCase):
             self.assertFalse(can_combine(switch_glu, x))
         switch_glu.train()
         self.assertFalse(can_combine(switch_glu, x))
-        for bits, dtype in ((3, mx.bfloat16), (4, mx.float32)):
+        for bits, dtype in ((1, mx.bfloat16), (4, mx.float32)):
             other = _switch_glu(512, 256, 8, bits=bits, group_size=64, dtype=dtype)
             self.assertFalse(can_combine(other, x))
         unquantized = SwitchGLU(512, 256, 8)
