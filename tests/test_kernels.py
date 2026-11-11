@@ -40,12 +40,14 @@ from mlx_lm.models import (
     gemma4_text,
     glm4_moe,
     glm4_moe_lite,
+    gpt_oss,
     granitemoehybrid,
     hunyuan,
     jamba,
     kimi_k3,
     laguna,
     lfm2_moe,
+    longcat_flash,
     mellum,
     mimo_v2_flash,
     minimax,
@@ -216,6 +218,10 @@ _MOE_ARGS = SimpleNamespace(
     latent_moe_use_norm=False,
     activation_situ_beta=1.0,
     activation_situ_linear_beta=1.0,
+    zero_expert_num=2,
+    zero_expert_type="identity",
+    expert_ffn_hidden_size=64,
+    router_bias=False,
 )
 
 
@@ -527,9 +533,11 @@ class TestKernels(unittest.TestCase):
                 "expert_routing",
             ),
             (kimi_k3, kimi_k3.KimiK3SparseMoE, _MOE_ARGS, "expert_routing"),
+            (gpt_oss, gpt_oss.MLPBlock, _MOE_ARGS, "softmax_topk"),
+            (longcat_flash, longcat_flash.LongcatFlashMoE, _MOE_ARGS, None),
         ]
         # SwigluOAI and SiTU have no Metal kernel: only the routing is fused.
-        unfused = {minimax_m3_vl, kimi_k3}
+        unfused = {minimax_m3_vl, kimi_k3, gpt_oss}
         for module, block_cls, args, routing in blocks:
             with self.subTest(module.__name__, n_group=args.n_group):
                 mx.random.seed(7)
